@@ -10,9 +10,11 @@ const CONFIG = {
   STYLE_URL: 'https://api.maptiler.com/maps/outdoor-v2/style.json',
   CACHE_NAME: 'topocache-v1',
   DB_NAME: 'topocache-db',
-  DB_VERSION: 1,
+  DB_VERSION: 2,
   STORE_TRAILS: 'trails',
   STORE_REGIONS: 'regions',
+  STORE_ACTIVE_SESSION: 'activeSession',
+  ACTIVE_SESSION_ID: 'current',
   UNITS: 'imperial', // 'imperial' | 'metric'
   DOWNLOAD_CONCURRENCY: 5,
   DELETE_CONCURRENCY: 10,
@@ -97,6 +99,31 @@ const dom = {
 
 // ─── Service Worker & Persistent Storage ─────────────────────────────────────
 
+let swPendingReload = false;
+
+function watchServiceWorkerUpdates(reg) {
+  reg.addEventListener('updatefound', () => {
+    const worker = reg.installing;
+    if (!worker) return;
+
+    worker.addEventListener('statechange', () => {
+      if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+        swPendingReload = true;
+      }
+    });
+  });
+
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!swPendingReload) return;
+    if (state.tracking) return;
+    location.reload();
+  });
+}
+
+function maybeReloadForServiceWorker() {
+  if (swPendingReload && !state.tracking) location.reload();
+}
+
 async function registerServiceWorker() {
   if (!('serviceWorker' in navigator)) {
     console.warn('Service workers not supported');
@@ -105,8 +132,13 @@ async function registerServiceWorker() {
   try {
     const reg = await navigator.serviceWorker.register('/sw.js');
     console.log('Service worker registered:', reg.scope);
+    watchServiceWorkerUpdates(reg);
     reg.update();
     await navigator.serviceWorker.ready;
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') reg.update();
+    });
   } catch (err) {
     console.error('SW registration failed:', err);
   }
@@ -137,6 +169,9 @@ function openDB() {
       if (!db.objectStoreNames.contains(CONFIG.STORE_REGIONS)) {
         db.createObjectStore(CONFIG.STORE_REGIONS, { keyPath: 'id', autoIncrement: true });
       }
+      if (!db.objectStoreNames.contains(CONFIG.STORE_ACTIVE_SESSION)) {
+        db.createObjectStore(CONFIG.STORE_ACTIVE_SESSION, { keyPath: 'id' });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -158,6 +193,16 @@ async function dbGetAll(store) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, 'readonly');
     const req = tx.objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbGet(store, id) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).get(id);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -209,6 +254,37 @@ async function updateRegion(id, patch) {
   const region = regions.find((r) => r.id === id);
   if (!region) return;
   await dbUpdate(CONFIG.STORE_REGIONS, { ...region, ...patch });
+}
+
+// Active hike session (in-progress recording, survives reload)
+const getActiveSession = () => dbGet(CONFIG.STORE_ACTIVE_SESSION, CONFIG.ACTIVE_SESSION_ID);
+
+function activeSessionRecord() {
+  return {
+    id: CONFIG.ACTIVE_SESSION_ID,
+    startTime: state.startTime,
+    coordinates: [...state.coordinates],
+    distanceMeters: state.distanceMeters,
+    lastPosition: state.lastPosition ? [...state.lastPosition] : null,
+    lastTimestamp: state.lastTimestamp,
+  };
+}
+
+async function persistActiveSession() {
+  if (!state.startTime) return;
+  try {
+    await dbUpdate(CONFIG.STORE_ACTIVE_SESSION, activeSessionRecord());
+  } catch (err) {
+    console.warn('Failed to persist active session', err);
+  }
+}
+
+async function clearActiveSession() {
+  try {
+    await dbDelete(CONFIG.STORE_ACTIVE_SESSION, CONFIG.ACTIVE_SESSION_ID);
+  } catch (err) {
+    console.warn('Failed to clear active session', err);
+  }
 }
 
 // ─── Utility Functions ───────────────────────────────────────────────────────
@@ -466,7 +542,6 @@ function initMap() {
     trackUserLocation: true,
     showUserLocation: true,
   });
-  geolocate._updateCamera = function () {};
   state.geolocate = geolocate;
   state.map.addControl(geolocate, 'top-left');
 
@@ -921,6 +996,27 @@ function syncTrackingLayout() {
   }
 }
 
+function beginTrackingUI() {
+  dom.hud.classList.remove('hidden');
+  syncTrackingLayout();
+  dom.btnTrack.classList.add('tracking');
+  dom.btnTrack.title = 'Stop & Save';
+  dom.btnTrack.setAttribute('aria-label', 'Stop and Save');
+  dom.btnTrack.innerHTML =
+    '<svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>';
+}
+
+function startGpsWatch() {
+  state.timerInterval = setInterval(updateStatsHUD, 1000);
+  state.gpsWatchId = navigator.geolocation.watchPosition(
+    onPositionUpdate,
+    () => {
+      if (state.tracking) dom.hudWarning.textContent = 'GPS signal weak';
+    },
+    CONFIG.GPS_OPTIONS
+  );
+}
+
 function startTracking() {
   if (state.tracking) return;
   if (!navigator.geolocation) {
@@ -936,29 +1032,40 @@ function startTracking() {
   state.lastTimestamp = null;
   state.startTime = Date.now();
 
-  dom.hud.classList.remove('hidden');
-  syncTrackingLayout();
-  dom.btnTrack.classList.add('tracking');
-  dom.btnTrack.title = 'Stop & Save';
-  dom.btnTrack.setAttribute('aria-label', 'Stop and Save');
-  dom.btnTrack.innerHTML =
-    '<svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>';
-
-  // Duration timer — updates HUD every second
-  state.timerInterval = setInterval(updateStatsHUD, 1000);
-  ensureGeolocateActive();
-  state.gpsWatchId = navigator.geolocation.watchPosition(
-    onPositionUpdate,
-    () => {
-      if (state.tracking) dom.hudWarning.textContent = 'GPS signal weak';
-    },
-    CONFIG.GPS_OPTIONS
-  );
+  beginTrackingUI();
+  startGpsWatch();
+  persistActiveSession();
 }
 
-function ensureGeolocateActive() {
-  const g = state.geolocate;
-  if (g && g._watchState === 'OFF') g.trigger();
+async function resumeTracking(session) {
+  if (state.tracking) return;
+  if (!navigator.geolocation) {
+    showToast('Geolocation not supported on this device');
+    return;
+  }
+
+  state.tracking = true;
+  state.startTime = session.startTime;
+  state.coordinates = session.coordinates || [];
+  state.distanceMeters = session.distanceMeters || 0;
+  state.lastPosition = session.lastPosition || null;
+  state.lastTimestamp = session.lastTimestamp ?? null;
+
+  beginTrackingUI();
+  updateActiveTrail();
+  updateStatsHUD();
+  startGpsWatch();
+  showToast('Resumed hike recording');
+}
+
+async function restoreActiveSession() {
+  try {
+    const session = await getActiveSession();
+    if (!session?.startTime) return;
+    await resumeTracking(session);
+  } catch (err) {
+    console.warn('Failed to restore active session', err);
+  }
 }
 
 function stopTracking() {
@@ -980,13 +1087,17 @@ function stopTracking() {
 
   // Open save modal if we have enough points
   if (state.coordinates.length >= 2) {
+    persistActiveSession();
     openNameModal('trail', `Hike ${new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`);
   } else {
+    clearActiveSession();
     dom.hud.classList.add('hidden');
     syncTrackingLayout();
     clearActiveTrail();
     showToast('Not enough GPS points to save');
   }
+
+  maybeReloadForServiceWorker();
 }
 
 function onPositionUpdate(pos) {
@@ -1008,6 +1119,7 @@ function onPositionUpdate(pos) {
 
   updateActiveTrail();
   dom.hudWarning.textContent = '';
+  persistActiveSession();
 }
 
 function updateActiveTrail() {
@@ -1063,8 +1175,10 @@ async function saveCurrentTrail(name) {
   state.coordinates = [];
   state.distanceMeters = 0;
   state.startTime = null;
+  await clearActiveSession();
   showToast(`Trail "${name}" saved`);
   renderTrailsDrawer();
+  maybeReloadForServiceWorker();
 }
 
 function trailBounds(coordinates) {
@@ -1350,6 +1464,10 @@ function bindEvents() {
   window.addEventListener('resize', () => {
     if (!dom.hud.classList.contains('hidden')) syncTrackingLayout();
   });
+
+  window.addEventListener('pagehide', () => {
+    if (state.startTime) persistActiveSession();
+  });
 }
 
 // ─── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -1359,6 +1477,7 @@ async function init() {
   await registerServiceWorker();
   await requestPersistentStorage();
   initMap();
+  await restoreActiveSession();
   await renderRegionsDrawer();
   if (!navigator.onLine) restoreOfflineView();
 }
