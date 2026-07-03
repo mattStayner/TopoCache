@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1419">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TopoCache">
+  <meta name="description" content="Offline topo maps and hike tracking for the backcountry">
+  <title>TopoCache</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-192.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.svg">
+  <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg-dark: #0f1419;
+      --bg-glass: rgba(15, 20, 25, 0.88);
+      --bg-card: #1a2229;
+      --accent: #00e5a0;
+      --accent-dim: #00b87d;
+      --text: #e8edf2;
+      --text-muted: #8a9bab;
+      --danger: #ff5c5c;
+      --border: rgba(255, 255, 255, 0.08);
+      --shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+      --safe-left: env(safe-area-inset-left, 0px);
+      --safe-right: env(safe-area-inset-right, 0px);
+    }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text);
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    #map {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+    }
+
+    /* ── HUD ── */
+    .hud {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 10;
+      padding: calc(12px + var(--safe-top)) calc(16px + var(--safe-right)) 12px calc(16px + var(--safe-left));
+      background: var(--bg-glass);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      transition: transform 0.3s ease;
+    }
+
+    .hud.hidden { transform: translateY(-100%); }
+
+    .hud-brand {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--accent);
+      white-space: nowrap;
+    }
+
+    .hud-stats {
+      display: flex;
+      gap: 16px;
+      flex: 1;
+      justify-content: center;
+    }
+
+    .hud-stat {
+      text-align: center;
+      min-width: 72px;
+    }
+
+    .hud-stat-label {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+    }
+
+    .hud-stat-value {
+      font-size: 1.1rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .hud-warning {
+      font-size: 0.75rem;
+      color: #ffb347;
+      text-align: right;
+      max-width: 120px;
+    }
+
+    /* ── FAB controls ── */
+    .fab-group {
+      position: fixed;
+      bottom: calc(24px + var(--safe-bottom));
+      right: calc(16px + var(--safe-right));
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      align-items: flex-end;
+    }
+
+    .fab {
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      background: var(--bg-glass);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      color: var(--text);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: var(--shadow);
+      transition: background 0.2s, transform 0.15s, color 0.2s;
+    }
+
+    .fab:active { transform: scale(0.93); }
+    .fab:hover { background: var(--bg-card); }
+    .fab.active { background: var(--accent); color: var(--bg-dark); border-color: var(--accent); }
+    .fab.danger { background: rgba(255, 92, 92, 0.15); color: var(--danger); border-color: rgba(255, 92, 92, 0.3); }
+    .fab.tracking { background: var(--accent); color: var(--bg-dark); border-color: var(--accent); animation: pulse 2s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(0, 229, 160, 0.4); }
+      50% { box-shadow: 0 0 0 8px rgba(0, 229, 160, 0); }
+    }
+
+    .fab svg { width: 22px; height: 22px; fill: currentColor; }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed;
+      bottom: calc(100px + var(--safe-bottom));
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      z-index: 50;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 18px;
+      font-size: 0.875rem;
+      box-shadow: var(--shadow);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.3s;
+      max-width: 90vw;
+      text-align: center;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* ── Banner ── */
+    .offline-banner {
+      position: fixed;
+      top: calc(60px + var(--safe-top));
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 9;
+      background: rgba(255, 179, 71, 0.15);
+      border: 1px solid rgba(255, 179, 71, 0.4);
+      color: #ffb347;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      display: none;
+      max-width: 90vw;
+      text-align: center;
+    }
+
+    .offline-banner.show { display: block; }
+
+    /* ── Modal ── */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s;
+    }
+
+    .modal-overlay.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .modal {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px 24px 20px;
+      width: 100%;
+      max-width: 380px;
+      box-shadow: var(--shadow);
+      transform: translateY(16px);
+      transition: transform 0.25s;
+    }
+
+    .modal-overlay.open .modal { transform: translateY(0); }
+
+    .modal h2 {
+      font-size: 1.15rem;
+      margin-bottom: 6px;
+    }
+
+    .modal p {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+    }
+
+    .modal input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-dark);
+      color: var(--text);
+      font-size: 1rem;
+      outline: none;
+      margin-bottom: 16px;
+    }
+
+    .modal input:focus { border-color: var(--accent); }
+
+    .modal-actions {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+    }
+
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: var(--bg-dark); }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-dim); }
+    .btn-ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+    .btn-ghost:hover:not(:disabled) { background: rgba(255,255,255,0.05); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover:not(:disabled) { background: #e04545; }
+
+    /* ── Drawers ── */
+    .drawer-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      background: rgba(0, 0, 0, 0.5);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s;
+    }
+
+    .drawer-overlay.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 90;
+      width: min(360px, 92vw);
+      background: var(--bg-card);
+      border-left: 1px solid var(--border);
+      transform: translateX(100%);
+      transition: transform 0.3s ease;
+      display: flex;
+      flex-direction: column;
+      padding-top: var(--safe-top);
+      padding-bottom: var(--safe-bottom);
+    }
+
+    .drawer.open { transform: translateX(0); }
+
+    .drawer-header {
+      padding: 20px 20px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .drawer-header h2 {
+      font-size: 1.1rem;
+    }
+
+    .drawer-summary {
+      padding: 10px 20px;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      background: rgba(0,0,0,0.2);
+    }
+
+    .drawer-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 4px;
+      display: flex;
+    }
+
+    .drawer-close svg { width: 22px; height: 22px; fill: currentColor; }
+
+    .drawer-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 0;
+    }
+
+    .drawer-empty {
+      padding: 32px 20px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .drawer-item {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+
+    .drawer-item-body { flex: 1; min-width: 0; }
+
+    .drawer-item-name {
+      font-weight: 600;
+      font-size: 0.95rem;
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .drawer-item-meta {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    .drawer-item-actions {
+      display: flex;
+      gap: 6px;
+      flex-shrink: 0;
+      align-items: center;
+    }
+
+    .icon-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.2s, border-color 0.2s;
+    }
+
+    .icon-btn:hover { color: var(--text); border-color: var(--text-muted); }
+    .icon-btn.danger:hover { color: var(--danger); border-color: var(--danger); }
+    .icon-btn svg { width: 16px; height: 16px; fill: currentColor; }
+
+    .trail-toggle {
+      width: 20px;
+      height: 20px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .drawer-footer {
+      padding: 12px 20px;
+      border-top: 1px solid var(--border);
+    }
+
+    /* ── Download panel ── */
+    .download-panel {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 85;
+      background: var(--bg-card);
+      border-top: 1px solid var(--border);
+      border-radius: 16px 16px 0 0;
+      padding: 20px 20px calc(20px + var(--safe-bottom));
+      transform: translateY(100%);
+      transition: transform 0.3s ease;
+      max-height: 70vh;
+      overflow-y: auto;
+    }
+
+    .download-panel.open { transform: translateY(0); }
+
+    .download-panel h2 {
+      font-size: 1.1rem;
+      margin-bottom: 4px;
+    }
+
+    .download-panel .subtitle {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+    }
+
+    .form-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      gap: 12px;
+    }
+
+    .form-row label {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+
+    .form-row select {
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-dark);
+      color: var(--text);
+      font-size: 0.9rem;
+    }
+
+    .progress-wrap {
+      margin: 16px 0;
+      display: none;
+    }
+
+    .progress-wrap.active { display: block; }
+
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      border-radius: 4px;
+      background: var(--bg-dark);
+      overflow: hidden;
+      margin-bottom: 8px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 4px;
+      width: 0%;
+      transition: width 0.2s;
+    }
+
+    .progress-text {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      text-align: center;
+    }
+
+    .panel-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .panel-actions .btn { flex: 1; }
+
+    .panel-link {
+      display: block;
+      text-align: center;
+      margin-top: 12px;
+      font-size: 0.85rem;
+      color: var(--accent);
+      cursor: pointer;
+      background: none;
+      border: none;
+      width: 100%;
+      padding: 8px;
+    }
+
+    .panel-link:hover { text-decoration: underline; }
+
+    /* ── Confirm dialog ── */
+    .confirm-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 110;
+      background: rgba(0, 0, 0, 0.65);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s;
+    }
+
+    .confirm-overlay.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 480px) {
+      .hud { flex-wrap: wrap; }
+      .hud-stats { width: 100%; justify-content: space-around; order: 3; }
+      .hud-brand { font-size: 0.9rem; }
+      .hud-stat-value { font-size: 1rem; }
+      .fab { width: 48px; height: 48px; }
+    }
+
+    /* MapLibre controls — keep default white chrome so sprite icons stay visible */
+    .maplibregl-ctrl-top-left,
+    .maplibregl-ctrl-top-right,
+    .maplibregl-ctrl-bottom-left,
+    .maplibregl-ctrl-bottom-right {
+      z-index: 5;
+    }
+
+    .maplibregl-ctrl-group {
+      box-shadow: var(--shadow) !important;
+    }
+
+    .maplibregl-ctrl-group:not(:empty) {
+      box-shadow: var(--shadow) !important;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="map"></div>
+
+  <!-- HUD: visible when tracking -->
+  <header class="hud hidden" id="hud">
+    <span class="hud-brand">TopoCache</span>
+    <div class="hud-stats">
+      <div class="hud-stat">
+        <div class="hud-stat-label">Distance</div>
+        <div class="hud-stat-value" id="stat-distance">0.00 mi</div>
+      </div>
+      <div class="hud-stat">
+        <div class="hud-stat-label">Duration</div>
+        <div class="hud-stat-value" id="stat-duration">00:00:00</div>
+      </div>
+      <div class="hud-stat">
+        <div class="hud-stat-label">Avg Speed</div>
+        <div class="hud-stat-value" id="stat-speed">0.0 mph</div>
+      </div>
+    </div>
+    <div class="hud-warning" id="hud-warning"></div>
+  </header>
+
+  <div class="offline-banner" id="offline-banner">No offline maps cached for this area</div>
+
+  <!-- Floating action buttons -->
+  <nav class="fab-group" aria-label="Map controls">
+    <button class="fab" id="btn-download" title="Download Current View" aria-label="Download Current View">
+      <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+    </button>
+    <button class="fab" id="btn-track" title="Start Tracking" aria-label="Start Tracking">
+      <svg viewBox="0 0 24 24" id="icon-play"><path d="M8 5v14l11-7z"/></svg>
+    </button>
+    <button class="fab" id="btn-center" title="Center on Me" aria-label="Center on Me">
+      <svg viewBox="0 0 24 24"><path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zm8.94 3A8.994 8.994 0 0 0 13 3.06V1h-2v2.06A8.994 8.994 0 0 0 3.06 11H1v2h2.06A8.994 8.994 0 0 0 11 20.94V23h2v-2.06A8.994 8.994 0 0 0 20.94 13H23v-2h-2.06zM12 19c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>
+    </button>
+    <button class="fab" id="btn-lock" title="Lock to GPS" aria-label="Lock to GPS">
+      <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+    </button>
+    <button class="fab" id="btn-trails" title="My Saved Hikes" aria-label="My Saved Hikes">
+      <svg viewBox="0 0 24 24"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>
+    </button>
+  </nav>
+
+  <!-- Toast notification -->
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <!-- Name modal (trails & regions) -->
+  <div class="modal-overlay" id="name-modal" role="dialog" aria-modal="true" aria-labelledby="name-modal-title">
+    <div class="modal">
+      <h2 id="name-modal-title">Name your trail</h2>
+      <p id="name-modal-desc">Give this hike a memorable name.</p>
+      <input type="text" id="name-input" placeholder="e.g. Wind River Loop" maxlength="80" autocomplete="off">
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="name-cancel">Cancel</button>
+        <button class="btn btn-primary" id="name-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirm dialog -->
+  <div class="confirm-overlay" id="confirm-modal" role="dialog" aria-modal="true">
+    <div class="modal">
+      <h2 id="confirm-title">Confirm</h2>
+      <p id="confirm-message"></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="confirm-cancel">Cancel</button>
+        <button class="btn btn-danger" id="confirm-ok">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Saved Trails drawer -->
+  <div class="drawer-overlay" id="trails-overlay"></div>
+  <aside class="drawer" id="trails-drawer" aria-label="Saved trails">
+    <div class="drawer-header">
+      <h2>Saved Hikes</h2>
+      <button class="drawer-close" id="trails-close" aria-label="Close">
+        <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+      </button>
+    </div>
+    <div class="drawer-list" id="trails-list">
+      <div class="drawer-empty">No saved hikes yet. Start tracking to record your first trail.</div>
+    </div>
+  </aside>
+
+  <!-- Cached Maps drawer -->
+  <div class="drawer-overlay" id="regions-overlay"></div>
+  <aside class="drawer" id="regions-drawer" aria-label="Cached maps">
+    <div class="drawer-header">
+      <h2>Cached Maps</h2>
+      <button class="drawer-close" id="regions-close" aria-label="Close">
+        <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+      </button>
+    </div>
+    <div class="drawer-summary" id="regions-summary">Loading storage info…</div>
+    <div class="drawer-list" id="regions-list">
+      <div class="drawer-empty">No offline maps cached yet. Download your current view to get started.</div>
+    </div>
+    <div class="drawer-footer">
+      <button class="btn btn-danger" id="btn-delete-all-regions" style="width:100%">Delete All Cached Maps</button>
+    </div>
+  </aside>
+
+  <!-- Download panel -->
+  <section class="download-panel" id="download-panel" aria-label="Download map">
+    <h2>Download Current View</h2>
+    <p class="subtitle">Cache map tiles for offline use in this area.</p>
+    <div class="form-row">
+      <label for="max-zoom">Max zoom level</label>
+      <select id="max-zoom">
+        <option value="13">13 (fast)</option>
+        <option value="14">14</option>
+        <option value="15" selected>15 (recommended)</option>
+        <option value="16">16 (detailed)</option>
+      </select>
+    </div>
+    <div class="progress-wrap" id="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+      <div class="progress-text" id="progress-text">Preparing…</div>
+    </div>
+    <div class="panel-actions">
+      <button class="btn btn-ghost" id="download-cancel">Cancel</button>
+      <button class="btn btn-primary" id="download-start">Download</button>
+    </div>
+    <button class="panel-link" id="open-regions-drawer">View Cached Maps →</button>
+  </section>
+
+  <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
