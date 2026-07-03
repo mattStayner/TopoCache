@@ -21,6 +21,8 @@ const CONFIG = {
   GPS_ACCURACY_THRESHOLD: 100, // meters — skip fixes worse than this
   GPS_OPTIONS: { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 },
   TILE_WARN_THRESHOLD: 2000,
+  MAP_VIEW_KEY: 'topocache-map-view',
+  UTAH_BOUNDS: [[-114.05, 37.0], [-109.04, 42.0]],
 };
 
 // ─── Application State ───────────────────────────────────────────────────────
@@ -36,6 +38,7 @@ const state = {
   lastPosition: null,
   lastTimestamp: null,
   visibleTrails: new Set(),
+  gpsWatchId: null,
   downloading: false,
   downloadAbort: null,
   pendingRegionTiles: [],
@@ -43,6 +46,7 @@ const state = {
   pendingRegionZoom: null,
   nameModalMode: null, // 'trail' | 'region' | 'rename-region'
   renameRegionId: null,
+  skipMapViewSave: false,
 };
 
 // ─── DOM References ──────────────────────────────────────────────────────────
@@ -183,6 +187,17 @@ async function dbDelete(store, id) {
 const saveTrail = (record) => dbAdd(CONFIG.STORE_TRAILS, record);
 const getAllTrails = () => dbGetAll(CONFIG.STORE_TRAILS);
 const deleteTrail = (id) => dbDelete(CONFIG.STORE_TRAILS, id);
+
+async function updateTrail(id, patch) {
+  const trails = await getAllTrails();
+  const trail = trails.find((t) => t.id === id);
+  if (!trail) return;
+  await dbUpdate(CONFIG.STORE_TRAILS, { ...trail, ...patch });
+}
+
+function trailIsVisible(trail) {
+  return trail.visible !== false;
+}
 
 // Region CRUD
 const saveRegion = (record) => dbAdd(CONFIG.STORE_REGIONS, record);
@@ -368,6 +383,59 @@ async function fetchAndCacheBatch(urls, concurrency, onProgress, signal) {
   return cached;
 }
 
+// ─── Map View Persistence ──────────────────────────────────────────────────────
+
+function loadMapView() {
+  try {
+    const raw = localStorage.getItem(CONFIG.MAP_VIEW_KEY);
+    if (!raw) return null;
+    const view = JSON.parse(raw);
+    if (
+      Array.isArray(view.center) &&
+      view.center.length === 2 &&
+      typeof view.center[0] === 'number' &&
+      typeof view.center[1] === 'number' &&
+      typeof view.zoom === 'number'
+    ) {
+      return {
+        center: view.center,
+        zoom: view.zoom,
+        bearing: typeof view.bearing === 'number' ? view.bearing : 0,
+        pitch: typeof view.pitch === 'number' ? view.pitch : 0,
+      };
+    }
+  } catch (e) {
+    console.warn('Failed to load map view', e);
+  }
+  return null;
+}
+
+function saveMapView() {
+  if (!state.map || state.skipMapViewSave) return;
+  try {
+    const center = state.map.getCenter();
+    localStorage.setItem(
+      CONFIG.MAP_VIEW_KEY,
+      JSON.stringify({
+        center: [center.lng, center.lat],
+        zoom: state.map.getZoom(),
+        bearing: state.map.getBearing(),
+        pitch: state.map.getPitch(),
+      })
+    );
+  } catch (e) {
+    console.warn('Failed to save map view', e);
+  }
+}
+
+function runWithoutMapViewSave(fn) {
+  state.skipMapViewSave = true;
+  fn();
+  state.map.once('moveend', () => {
+    state.skipMapViewSave = false;
+  });
+}
+
 // ─── Map Initialization ──────────────────────────────────────────────────────
 
 function initMap() {
@@ -378,14 +446,19 @@ function initMap() {
   }
 
   const styleUrl = `${CONFIG.STYLE_URL}?key=${CONFIG.MAPTILER_KEY}`;
+  const savedView = loadMapView();
 
   state.map = new maplibregl.Map({
     container: 'map',
     style: styleUrl,
-    center: [-110.5, 43.5],
-    zoom: 12,
+    center: savedView?.center ?? [-111.5, 39.5],
+    zoom: savedView?.zoom ?? 6,
+    bearing: savedView?.bearing ?? 0,
+    pitch: savedView?.pitch ?? 0,
     attributionControl: true,
   });
+
+  state.map.on('moveend', saveMapView);
 
   state.map.addControl(new maplibregl.NavigationControl(), 'top-left');
   const geolocate = new maplibregl.GeolocateControl({
@@ -396,14 +469,6 @@ function initMap() {
   geolocate._updateCamera = function () {};
   state.geolocate = geolocate;
   state.map.addControl(geolocate, 'top-left');
-  geolocate.on('geolocate', (e) => {
-    if (state.tracking) {
-      onPositionUpdate({ coords: e.coords, timestamp: e.timestamp });
-    }
-  });
-  geolocate.on('error', () => {
-    if (state.tracking) dom.hudWarning.textContent = 'GPS signal weak';
-  });
 
   state.map.on('load', () => {
     // Active trail line (live GPS breadcrumb)
@@ -441,22 +506,14 @@ function initMap() {
       },
     });
 
-    // Try to center on user location (online only — geolocation still works offline
-    // but we prefer a cached region when offline; see restoreOfflineView)
-    if (navigator.geolocation && navigator.onLine) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          state.map.flyTo({
-            center: [pos.coords.longitude, pos.coords.latitude],
-            zoom: 13,
-          });
-        },
-        () => {},
-        { enableHighAccuracy: true, timeout: 10000 }
-      );
+    if (!savedView && navigator.onLine) {
+      runWithoutMapViewSave(() => {
+        state.map.fitBounds(CONFIG.UTAH_BOUNDS, { padding: 40, duration: 0 });
+      });
     }
 
     restoreOfflineView();
+    initSavedTrailsOnMap();
   });
 
   // Show offline banner when map fails to load tiles (no cache)
@@ -479,10 +536,12 @@ async function restoreOfflineView() {
 
   regions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const { bounds: b } = regions[0];
-  state.map.fitBounds(
-    [[b.west, b.south], [b.east, b.north]],
-    { padding: 40, duration: 0 }
-  );
+  runWithoutMapViewSave(() => {
+    state.map.fitBounds(
+      [[b.west, b.south], [b.east, b.north]],
+      { padding: 40, duration: 0 }
+    );
+  });
   dom.offlineBanner.classList.remove('show');
 }
 
@@ -871,6 +930,7 @@ function startTracking() {
 
   state.tracking = true;
   state.coordinates = [];
+  clearActiveTrail();
   state.distanceMeters = 0;
   state.lastPosition = null;
   state.lastTimestamp = null;
@@ -887,6 +947,13 @@ function startTracking() {
   // Duration timer — updates HUD every second
   state.timerInterval = setInterval(updateStatsHUD, 1000);
   ensureGeolocateActive();
+  state.gpsWatchId = navigator.geolocation.watchPosition(
+    onPositionUpdate,
+    () => {
+      if (state.tracking) dom.hudWarning.textContent = 'GPS signal weak';
+    },
+    CONFIG.GPS_OPTIONS
+  );
 }
 
 function ensureGeolocateActive() {
@@ -899,6 +966,10 @@ function stopTracking() {
 
   clearInterval(state.timerInterval);
   state.timerInterval = null;
+  if (state.gpsWatchId != null) {
+    navigator.geolocation.clearWatch(state.gpsWatchId);
+    state.gpsWatchId = null;
+  }
   state.tracking = false;
 
   dom.btnTrack.classList.remove('tracking');
@@ -974,6 +1045,7 @@ async function saveCurrentTrail(name) {
     distance: state.distanceMeters,
     duration: elapsed,
     createdAt: new Date().toISOString(),
+    visible: true,
     geojson: {
       type: 'Feature',
       geometry: { type: 'LineString', coordinates: [...state.coordinates] },
@@ -981,7 +1053,10 @@ async function saveCurrentTrail(name) {
     },
   };
 
-  await saveTrail(record);
+  const id = await saveTrail(record);
+  state.visibleTrails.add(id);
+  await refreshSavedTrailsLayer();
+
   dom.hud.classList.add('hidden');
   syncTrackingLayout();
   clearActiveTrail();
@@ -990,6 +1065,39 @@ async function saveCurrentTrail(name) {
   state.startTime = null;
   showToast(`Trail "${name}" saved`);
   renderTrailsDrawer();
+}
+
+function trailBounds(coordinates) {
+  let west = Infinity;
+  let south = Infinity;
+  let east = -Infinity;
+  let north = -Infinity;
+  for (const [lng, lat] of coordinates) {
+    if (lng < west) west = lng;
+    if (lng > east) east = lng;
+    if (lat < south) south = lat;
+    if (lat > north) north = lat;
+  }
+  return [[west, south], [east, north]];
+}
+
+async function flyToTrail(id) {
+  const trails = await getAllTrails();
+  const trail = trails.find((t) => t.id === id);
+  if (!trail?.coordinates?.length || !state.map) return;
+
+  if (!state.visibleTrails.has(id)) {
+    await toggleTrailOnMap(id, true);
+  }
+
+  const { coordinates } = trail;
+  if (coordinates.length === 1) {
+    state.map.flyTo({ center: coordinates[0], zoom: 14, duration: 1200 });
+  } else {
+    state.map.fitBounds(trailBounds(coordinates), { padding: 60, duration: 1200, maxZoom: 16 });
+  }
+
+  closeDrawer('trails');
 }
 
 async function renderTrailsDrawer() {
@@ -1003,30 +1111,45 @@ async function renderTrailsDrawer() {
   }
 
   dom.trailsList.innerHTML = trails
-    .map(
-      (t) => `
+    .map((t) => {
+      const shown = state.visibleTrails.has(t.id);
+      return `
     <div class="drawer-item">
-      <input type="checkbox" class="trail-toggle" data-trail-id="${t.id}"
-        ${state.visibleTrails.has(t.id) ? 'checked' : ''}
-        aria-label="Show ${escapeHtml(t.name)} on map">
       <div class="drawer-item-body">
-        <div class="drawer-item-name">${escapeHtml(t.name)}</div>
+        <button type="button" class="trail-name-link" data-fly-trail="${t.id}" title="Zoom to hike">
+          ${escapeHtml(t.name)}
+        </button>
         <div class="drawer-item-meta">
           ${formatDate(t.createdAt)}<br>
           ${formatDistance(t.distance)} · ${formatDuration(t.duration)}
         </div>
       </div>
       <div class="drawer-item-actions">
+        <button class="icon-btn trail-visibility${shown ? ' active' : ''}" data-trail-id="${t.id}"
+          title="${shown ? 'Hide from map' : 'Show on map'}"
+          aria-label="${shown ? 'Hide' : 'Show'} ${escapeHtml(t.name)} on map"
+          aria-pressed="${shown}">
+          <svg viewBox="0 0 24 24">${shown
+            ? '<path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>'
+            : '<path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/>'}</svg>
+        </button>
         <button class="icon-btn danger" data-delete-trail="${t.id}" title="Delete trail" aria-label="Delete trail">
           <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
         </button>
       </div>
-    </div>`
-    )
+    </div>`;
+    })
     .join('');
 
-  dom.trailsList.querySelectorAll('.trail-toggle').forEach((cb) => {
-    cb.addEventListener('change', () => toggleTrailOnMap(parseInt(cb.dataset.trailId, 10), cb.checked));
+  dom.trailsList.querySelectorAll('[data-fly-trail]').forEach((btn) => {
+    btn.addEventListener('click', () => flyToTrail(parseInt(btn.dataset.flyTrail, 10)));
+  });
+
+  dom.trailsList.querySelectorAll('.trail-visibility').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = parseInt(btn.dataset.trailId, 10);
+      toggleTrailOnMap(id, !state.visibleTrails.has(id));
+    });
   });
 
   dom.trailsList.querySelectorAll('[data-delete-trail]').forEach((btn) => {
@@ -1039,6 +1162,17 @@ async function toggleTrailOnMap(id, visible) {
     state.visibleTrails.add(id);
   } else {
     state.visibleTrails.delete(id);
+  }
+  await updateTrail(id, { visible });
+  await refreshSavedTrailsLayer();
+  renderTrailsDrawer();
+}
+
+async function initSavedTrailsOnMap() {
+  const trails = await getAllTrails();
+  state.visibleTrails.clear();
+  for (const t of trails) {
+    if (trailIsVisible(t)) state.visibleTrails.add(t.id);
   }
   await refreshSavedTrailsLayer();
 }
