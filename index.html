@@ -12,7 +12,7 @@
   <link rel="manifest" href="manifest.json">
   <link rel="icon" href="icons/icon-192.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icons/icon-192.svg">
-  <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
+  <link href="/vendor/maplibre-gl.css" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -42,32 +42,48 @@
       -webkit-tap-highlight-color: transparent;
     }
 
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .map-shell {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+    }
+
     #map {
-      position: fixed;
+      position: absolute;
       inset: 0;
       z-index: 0;
     }
 
-    /* ── HUD ── */
+    /* ── HUD (bottom tracking bar — shrinks map, does not overlay) ── */
     .hud {
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
+      flex-shrink: 0;
       z-index: 10;
-      padding: calc(12px + var(--safe-top)) calc(16px + var(--safe-right)) 12px calc(16px + var(--safe-left));
+      padding: 12px calc(16px + var(--safe-right)) calc(12px + var(--safe-bottom)) calc(16px + var(--safe-left));
       background: var(--bg-glass);
       backdrop-filter: blur(12px);
       -webkit-backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--border);
+      border-top: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      transition: transform 0.3s ease;
+      overflow: hidden;
+      max-height: 140px;
+      transition: max-height 0.3s ease, padding 0.3s ease, border-color 0.3s ease;
     }
 
-    .hud.hidden { transform: translateY(-100%); }
+    .hud.hidden {
+      max-height: 0;
+      padding-top: 0;
+      padding-bottom: 0;
+      border-top-color: transparent;
+      pointer-events: none;
+    }
 
     .hud-brand {
       font-size: 1rem;
@@ -119,6 +135,11 @@
       flex-direction: column;
       gap: 10px;
       align-items: flex-end;
+      transition: bottom 0.3s ease;
+    }
+
+    body.tracking .fab-group {
+      bottom: calc(24px + var(--safe-bottom) + var(--hud-height, 0px));
     }
 
     .fab {
@@ -166,7 +187,7 @@
       box-shadow: var(--shadow);
       opacity: 0;
       pointer-events: none;
-      transition: opacity 0.3s, transform 0.3s;
+      transition: opacity 0.3s, transform 0.3s, bottom 0.3s ease;
       max-width: 90vw;
       text-align: center;
     }
@@ -176,10 +197,14 @@
       transform: translateX(-50%) translateY(0);
     }
 
+    body.tracking .toast {
+      bottom: calc(100px + var(--safe-bottom) + var(--hud-height, 0px));
+    }
+
     /* ── Banner ── */
     .offline-banner {
       position: fixed;
-      top: calc(60px + var(--safe-top));
+      top: calc(12px + var(--safe-top));
       left: 50%;
       transform: translateX(-50%);
       z-index: 9;
@@ -319,6 +344,13 @@
       padding: 20px 20px 12px;
       border-bottom: 1px solid var(--border);
       display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 12px;
+    }
+
+    .drawer-header-row {
+      display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
@@ -423,31 +455,17 @@
       border-top: 1px solid var(--border);
     }
 
-    /* ── Download panel ── */
-    .download-panel {
-      position: fixed;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      z-index: 85;
-      background: var(--bg-card);
-      border-top: 1px solid var(--border);
-      border-radius: 16px 16px 0 0;
-      padding: 20px 20px calc(20px + var(--safe-bottom));
-      transform: translateY(100%);
-      transition: transform 0.3s ease;
-      max-height: 70vh;
-      overflow-y: auto;
+    /* ── Download section (inside cached maps drawer) ── */
+    .download-section {
+      display: none;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(0, 0, 0, 0.15);
     }
 
-    .download-panel.open { transform: translateY(0); }
+    .download-section.open { display: block; }
 
-    .download-panel h2 {
-      font-size: 1.1rem;
-      margin-bottom: 4px;
-    }
-
-    .download-panel .subtitle {
+    .download-section .subtitle {
       font-size: 0.8rem;
       color: var(--text-muted);
       margin-bottom: 16px;
@@ -513,21 +531,6 @@
 
     .panel-actions .btn { flex: 1; }
 
-    .panel-link {
-      display: block;
-      text-align: center;
-      margin-top: 12px;
-      font-size: 0.85rem;
-      color: var(--accent);
-      cursor: pointer;
-      background: none;
-      border: none;
-      width: 100%;
-      padding: 8px;
-    }
-
-    .panel-link:hover { text-decoration: underline; }
-
     /* ── Confirm dialog ── */
     .confirm-overlay {
       position: fixed;
@@ -576,9 +579,13 @@
 </head>
 <body>
 
-  <div id="map"></div>
+  <div class="map-shell">
+    <div id="map"></div>
+  </div>
 
-  <!-- HUD: visible when tracking -->
+  <div class="offline-banner" id="offline-banner">No offline maps cached for this area</div>
+
+  <!-- HUD: slides up from bottom while tracking; map shrinks above it -->
   <header class="hud hidden" id="hud">
     <span class="hud-brand">TopoCache</span>
     <div class="hud-stats">
@@ -598,21 +605,13 @@
     <div class="hud-warning" id="hud-warning"></div>
   </header>
 
-  <div class="offline-banner" id="offline-banner">No offline maps cached for this area</div>
-
   <!-- Floating action buttons -->
   <nav class="fab-group" aria-label="Map controls">
-    <button class="fab" id="btn-download" title="Download Current View" aria-label="Download Current View">
-      <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-    </button>
     <button class="fab" id="btn-track" title="Start Tracking" aria-label="Start Tracking">
       <svg viewBox="0 0 24 24" id="icon-play"><path d="M8 5v14l11-7z"/></svg>
     </button>
-    <button class="fab" id="btn-center" title="Center on Me" aria-label="Center on Me">
-      <svg viewBox="0 0 24 24"><path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zm8.94 3A8.994 8.994 0 0 0 13 3.06V1h-2v2.06A8.994 8.994 0 0 0 3.06 11H1v2h2.06A8.994 8.994 0 0 0 11 20.94V23h2v-2.06A8.994 8.994 0 0 0 20.94 13H23v-2h-2.06zM12 19c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>
-    </button>
-    <button class="fab" id="btn-lock" title="Lock to GPS" aria-label="Lock to GPS">
-      <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+    <button class="fab" id="btn-regions" title="Cached Maps" aria-label="Cached Maps">
+      <svg viewBox="0 0 24 24"><path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/></svg>
     </button>
     <button class="fab" id="btn-trails" title="My Saved Hikes" aria-label="My Saved Hikes">
       <svg viewBox="0 0 24 24"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>
@@ -665,45 +664,44 @@
   <div class="drawer-overlay" id="regions-overlay"></div>
   <aside class="drawer" id="regions-drawer" aria-label="Cached maps">
     <div class="drawer-header">
-      <h2>Cached Maps</h2>
-      <button class="drawer-close" id="regions-close" aria-label="Close">
-        <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-      </button>
+      <div class="drawer-header-row">
+        <h2>Cached Maps</h2>
+        <button class="drawer-close" id="regions-close" aria-label="Close">
+          <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </div>
+      <button class="btn btn-primary" id="btn-download-new" style="width:100%">Download New</button>
     </div>
+    <section class="download-section" id="download-section" aria-label="Download map">
+      <p class="subtitle">Cache map tiles for offline use in this area.</p>
+      <div class="form-row">
+        <label for="max-zoom">Max zoom level</label>
+        <select id="max-zoom">
+          <option value="13">13 (fast)</option>
+          <option value="14">14</option>
+          <option value="15" selected>15 (recommended)</option>
+          <option value="16">16 (detailed)</option>
+        </select>
+      </div>
+      <div class="progress-wrap" id="progress-wrap">
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        <div class="progress-text" id="progress-text">Preparing…</div>
+      </div>
+      <div class="panel-actions">
+        <button class="btn btn-ghost" id="download-cancel">Cancel</button>
+        <button class="btn btn-primary" id="download-start">Download</button>
+      </div>
+    </section>
     <div class="drawer-summary" id="regions-summary">Loading storage info…</div>
     <div class="drawer-list" id="regions-list">
-      <div class="drawer-empty">No offline maps cached yet. Download your current view to get started.</div>
+      <div class="drawer-empty">No offline maps cached yet. Tap Download New to get started.</div>
     </div>
     <div class="drawer-footer">
       <button class="btn btn-danger" id="btn-delete-all-regions" style="width:100%">Delete All Cached Maps</button>
     </div>
   </aside>
 
-  <!-- Download panel -->
-  <section class="download-panel" id="download-panel" aria-label="Download map">
-    <h2>Download Current View</h2>
-    <p class="subtitle">Cache map tiles for offline use in this area.</p>
-    <div class="form-row">
-      <label for="max-zoom">Max zoom level</label>
-      <select id="max-zoom">
-        <option value="13">13 (fast)</option>
-        <option value="14">14</option>
-        <option value="15" selected>15 (recommended)</option>
-        <option value="16">16 (detailed)</option>
-      </select>
-    </div>
-    <div class="progress-wrap" id="progress-wrap">
-      <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
-      <div class="progress-text" id="progress-text">Preparing…</div>
-    </div>
-    <div class="panel-actions">
-      <button class="btn btn-ghost" id="download-cancel">Cancel</button>
-      <button class="btn btn-primary" id="download-start">Download</button>
-    </div>
-    <button class="panel-link" id="open-regions-drawer">View Cached Maps →</button>
-  </section>
-
-  <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+  <script src="/vendor/maplibre-gl.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

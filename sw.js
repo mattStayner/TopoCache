@@ -4,7 +4,16 @@
  */
 
 const CACHE_NAME = 'topocache-v1';
-const APP_SHELL = ['/', '/index.html', '/app.js', '/manifest.json', '/icons/icon-192.svg', '/icons/icon-512.svg'];
+const APP_SHELL = [
+  '/',
+  '/index.html',
+  '/app.js',
+  '/manifest.json',
+  '/icons/icon-192.svg',
+  '/icons/icon-512.svg',
+  '/vendor/maplibre-gl.js',
+  '/vendor/maplibre-gl.css',
+];
 
 const MAPTILER_HOSTS = ['api.maptiler.com', 'cdn.maptiler.com'];
 
@@ -69,7 +78,8 @@ self.addEventListener('fetch', (event) => {
  */
 async function handleCacheFirst(request) {
   const cache = await caches.open(CACHE_NAME);
-  const cached = await cache.match(request);
+  let cached = await cache.match(request);
+  if (!cached) cached = await cache.match(request.url);
 
   if (cached) return cached;
 

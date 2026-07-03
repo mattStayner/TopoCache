@@ -28,8 +28,7 @@ const CONFIG = {
 const state = {
   map: null,
   tracking: false,
-  lockToGps: false,
-  watchId: null,
+  geolocate: null,
   timerInterval: null,
   startTime: null,
   coordinates: [],
@@ -58,11 +57,10 @@ const dom = {
   hudWarning: $('hud-warning'),
   offlineBanner: $('offline-banner'),
   toast: $('toast'),
-  btnDownload: $('btn-download'),
   btnTrack: $('btn-track'),
-  btnCenter: $('btn-center'),
-  btnLock: $('btn-lock'),
   btnTrails: $('btn-trails'),
+  btnRegions: $('btn-regions'),
+  btnDownloadNew: $('btn-download-new'),
   nameModal: $('name-modal'),
   nameModalTitle: $('name-modal-title'),
   nameModalDesc: $('name-modal-desc'),
@@ -84,14 +82,13 @@ const dom = {
   regionsSummary: $('regions-summary'),
   regionsClose: $('regions-close'),
   btnDeleteAllRegions: $('btn-delete-all-regions'),
-  downloadPanel: $('download-panel'),
+  downloadSection: $('download-section'),
   maxZoom: $('max-zoom'),
   progressWrap: $('progress-wrap'),
   progressFill: $('progress-fill'),
   progressText: $('progress-text'),
   downloadCancel: $('download-cancel'),
   downloadStart: $('download-start'),
-  openRegionsDrawer: $('open-regions-drawer'),
 };
 
 // ─── Service Worker & Persistent Storage ─────────────────────────────────────
@@ -105,6 +102,7 @@ async function registerServiceWorker() {
     const reg = await navigator.serviceWorker.register('/sw.js');
     console.log('Service worker registered:', reg.scope);
     reg.update();
+    await navigator.serviceWorker.ready;
   } catch (err) {
     console.error('SW registration failed:', err);
   }
@@ -373,6 +371,12 @@ async function fetchAndCacheBatch(urls, concurrency, onProgress, signal) {
 // ─── Map Initialization ──────────────────────────────────────────────────────
 
 function initMap() {
+  if (typeof maplibregl === 'undefined') {
+    console.error('MapLibre GL failed to load');
+    showToast('Map library failed to load — reload when online once');
+    return;
+  }
+
   const styleUrl = `${CONFIG.STYLE_URL}?key=${CONFIG.MAPTILER_KEY}`;
 
   state.map = new maplibregl.Map({
@@ -384,7 +388,22 @@ function initMap() {
   });
 
   state.map.addControl(new maplibregl.NavigationControl(), 'top-left');
-  // GeolocateControl removed — duplicates the Center on Me FAB
+  const geolocate = new maplibregl.GeolocateControl({
+    positionOptions: CONFIG.GPS_OPTIONS,
+    trackUserLocation: true,
+    showUserLocation: true,
+  });
+  geolocate._updateCamera = function () {};
+  state.geolocate = geolocate;
+  state.map.addControl(geolocate, 'top-left');
+  geolocate.on('geolocate', (e) => {
+    if (state.tracking) {
+      onPositionUpdate({ coords: e.coords, timestamp: e.timestamp });
+    }
+  });
+  geolocate.on('error', () => {
+    if (state.tracking) dom.hudWarning.textContent = 'GPS signal weak';
+  });
 
   state.map.on('load', () => {
     // Active trail line (live GPS breadcrumb)
@@ -401,23 +420,6 @@ function initMap() {
         'line-width': 4,
         'line-cap': 'round',
         'line-join': 'round',
-      },
-    });
-
-    // Active position dot
-    state.map.addSource('active-position', {
-      type: 'geojson',
-      data: { type: 'Feature', geometry: { type: 'Point', coordinates: [0, 0] } },
-    });
-    state.map.addLayer({
-      id: 'active-position-dot',
-      type: 'circle',
-      source: 'active-position',
-      paint: {
-        'circle-radius': 8,
-        'circle-color': '#ffffff',
-        'circle-stroke-width': 3,
-        'circle-stroke-color': '#00e5a0',
       },
     });
 
@@ -439,8 +441,9 @@ function initMap() {
       },
     });
 
-    // Try to center on user location
-    if (navigator.geolocation) {
+    // Try to center on user location (online only — geolocation still works offline
+    // but we prefer a cached region when offline; see restoreOfflineView)
+    if (navigator.geolocation && navigator.onLine) {
       navigator.geolocation.getCurrentPosition(
         (pos) => {
           state.map.flyTo({
@@ -452,6 +455,8 @@ function initMap() {
         { enableHighAccuracy: true, timeout: 10000 }
       );
     }
+
+    restoreOfflineView();
   });
 
   // Show offline banner when map fails to load tiles (no cache)
@@ -460,6 +465,25 @@ function initMap() {
       dom.offlineBanner.classList.add('show');
     }
   });
+}
+
+/** When offline, fly to the most recently cached region so tiles are visible */
+async function restoreOfflineView() {
+  if (!state.map || navigator.onLine) return;
+
+  const regions = await getAllRegions();
+  if (regions.length === 0) {
+    dom.offlineBanner.classList.add('show');
+    return;
+  }
+
+  regions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const { bounds: b } = regions[0];
+  state.map.fitBounds(
+    [[b.west, b.south], [b.east, b.north]],
+    { padding: 40, duration: 0 }
+  );
+  dom.offlineBanner.classList.remove('show');
 }
 
 // ─── Offline Map Downloader ──────────────────────────────────────────────────
@@ -550,6 +574,14 @@ function extractFontsFromStyle(style) {
 /** Start downloading the current map view */
 async function startDownload() {
   if (state.downloading) return;
+  if (!state.map) {
+    showToast('Map not ready — reload the app');
+    return;
+  }
+  if (!navigator.onLine) {
+    showToast('Go online to download new map areas');
+    return;
+  }
 
   const maxZoom = parseInt(dom.maxZoom.value, 10);
   const bounds = state.map.getBounds();
@@ -610,7 +642,7 @@ async function startDownload() {
     };
     state.pendingRegionZoom = { min: minZoom, max: maxZoom };
 
-    dom.downloadPanel.classList.remove('open');
+    dom.downloadSection.classList.remove('open');
     resetDownloadUI();
     openNameModal('region', defaultMapName());
 
@@ -636,12 +668,28 @@ function resetDownloadUI() {
   dom.progressFill.style.width = '0%';
 }
 
+function hideDownloadSection() {
+  dom.downloadSection.classList.remove('open');
+}
+
+function toggleDownloadSection() {
+  if (!navigator.onLine) {
+    showToast('Go online to download new map areas');
+    return;
+  }
+  if (state.downloading) {
+    dom.downloadSection.classList.add('open');
+    return;
+  }
+  dom.downloadSection.classList.toggle('open');
+}
+
 function cancelDownload() {
   if (state.downloadAbort) {
     state.downloadAbort.abort();
   }
   resetDownloadUI();
-  dom.downloadPanel.classList.remove('open');
+  hideDownloadSection();
 }
 
 // ─── Cached Maps Management ──────────────────────────────────────────────────
@@ -698,7 +746,7 @@ async function renderRegionsDrawer() {
 
   if (regions.length === 0) {
     dom.regionsList.innerHTML =
-      '<div class="drawer-empty">No offline maps cached yet. Download your current view to get started.</div>';
+      '<div class="drawer-empty">No offline maps cached yet. Tap Download New to get started.</div>';
     return;
   }
 
@@ -794,6 +842,26 @@ async function deleteAllRegions() {
 
 // ─── GPS Tracking ────────────────────────────────────────────────────────────
 
+function syncTrackingLayout() {
+  const visible = !dom.hud.classList.contains('hidden');
+  document.body.classList.toggle('tracking', visible);
+
+  const apply = () => {
+    if (visible) {
+      document.documentElement.style.setProperty('--hud-height', `${dom.hud.offsetHeight}px`);
+    } else {
+      document.documentElement.style.removeProperty('--hud-height');
+    }
+    state.map?.resize();
+  };
+
+  if (visible) {
+    requestAnimationFrame(() => requestAnimationFrame(apply));
+  } else {
+    apply();
+  }
+}
+
 function startTracking() {
   if (state.tracking) return;
   if (!navigator.geolocation) {
@@ -809,6 +877,7 @@ function startTracking() {
   state.startTime = Date.now();
 
   dom.hud.classList.remove('hidden');
+  syncTrackingLayout();
   dom.btnTrack.classList.add('tracking');
   dom.btnTrack.title = 'Stop & Save';
   dom.btnTrack.setAttribute('aria-label', 'Stop and Save');
@@ -817,21 +886,17 @@ function startTracking() {
 
   // Duration timer — updates HUD every second
   state.timerInterval = setInterval(updateStatsHUD, 1000);
+  ensureGeolocateActive();
+}
 
-  state.watchId = navigator.geolocation.watchPosition(
-    onPositionUpdate,
-    onPositionError,
-    CONFIG.GPS_OPTIONS
-  );
+function ensureGeolocateActive() {
+  const g = state.geolocate;
+  if (g && g._watchState === 'OFF') g.trigger();
 }
 
 function stopTracking() {
   if (!state.tracking) return;
 
-  if (state.watchId !== null) {
-    navigator.geolocation.clearWatch(state.watchId);
-    state.watchId = null;
-  }
   clearInterval(state.timerInterval);
   state.timerInterval = null;
   state.tracking = false;
@@ -847,6 +912,7 @@ function stopTracking() {
     openNameModal('trail', `Hike ${new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`);
   } else {
     dom.hud.classList.add('hidden');
+    syncTrackingLayout();
     clearActiveTrail();
     showToast('Not enough GPS points to save');
   }
@@ -856,15 +922,11 @@ function onPositionUpdate(pos) {
   const { latitude, longitude, accuracy } = pos.coords;
   const timestamp = pos.timestamp;
 
-  // Skip low-accuracy fixes
   if (accuracy > CONFIG.GPS_ACCURACY_THRESHOLD) return;
-
-  // Skip duplicate timestamps
   if (timestamp === state.lastTimestamp) return;
 
   const coord = [longitude, latitude];
 
-  // Accumulate distance
   if (state.lastPosition) {
     state.distanceMeters += haversineMeters(state.lastPosition, coord);
   }
@@ -873,26 +935,8 @@ function onPositionUpdate(pos) {
   state.lastPosition = coord;
   state.lastTimestamp = timestamp;
 
-  // Update map layers
   updateActiveTrail();
-  updateActivePosition(coord);
-
-  // Lock camera to GPS if enabled
-  if (state.lockToGps) {
-    state.map.easeTo({
-      center: coord,
-      zoom: Math.max(state.map.getZoom(), 14),
-      duration: 800,
-    });
-  }
-
   dom.hudWarning.textContent = '';
-}
-
-function onPositionError(err) {
-  console.warn('GPS error:', err.message);
-  dom.hudWarning.textContent = 'GPS signal weak';
-  // Do not stop tracking — wait for signal to return
 }
 
 function updateActiveTrail() {
@@ -903,23 +947,11 @@ function updateActiveTrail() {
   });
 }
 
-function updateActivePosition(coord) {
-  if (!state.map?.getSource('active-position')) return;
-  state.map.getSource('active-position').setData({
-    type: 'Feature',
-    geometry: { type: 'Point', coordinates: coord },
-  });
-}
-
 function clearActiveTrail() {
   if (!state.map?.getSource('active-trail')) return;
   state.map.getSource('active-trail').setData({
     type: 'Feature',
     geometry: { type: 'LineString', coordinates: [] },
-  });
-  state.map.getSource('active-position').setData({
-    type: 'Feature',
-    geometry: { type: 'Point', coordinates: [0, 0] },
   });
 }
 
@@ -951,6 +983,7 @@ async function saveCurrentTrail(name) {
 
   await saveTrail(record);
   dom.hud.classList.add('hidden');
+  syncTrackingLayout();
   clearActiveTrail();
   state.coordinates = [];
   state.distanceMeters = 0;
@@ -1122,26 +1155,7 @@ function closeDrawer(which) {
   const drawer = which === 'trails' ? dom.trailsDrawer : dom.regionsDrawer;
   overlay.classList.remove('open');
   drawer.classList.remove('open');
-}
-
-// ─── Center on Me ────────────────────────────────────────────────────────────
-
-function centerOnMe() {
-  if (!navigator.geolocation) {
-    showToast('Geolocation not available');
-    return;
-  }
-  navigator.geolocation.getCurrentPosition(
-    (pos) => {
-      state.map.flyTo({
-        center: [pos.coords.longitude, pos.coords.latitude],
-        zoom: Math.max(state.map.getZoom(), 14),
-        duration: 1000,
-      });
-    },
-    () => showToast('Could not get your location'),
-    CONFIG.GPS_OPTIONS
-  );
+  if (which === 'regions' && !state.downloading) hideDownloadSection();
 }
 
 // ─── HTML Escape ─────────────────────────────────────────────────────────────
@@ -1157,29 +1171,15 @@ function escapeHtml(str) {
 // ─── Event Bindings ──────────────────────────────────────────────────────────
 
 function bindEvents() {
-  // Download
-  dom.btnDownload.addEventListener('click', () => {
-    dom.downloadPanel.classList.toggle('open');
-  });
+  // Download (inside cached maps drawer)
+  dom.btnDownloadNew.addEventListener('click', toggleDownloadSection);
   dom.downloadStart.addEventListener('click', startDownload);
   dom.downloadCancel.addEventListener('click', cancelDownload);
-  dom.openRegionsDrawer.addEventListener('click', () => {
-    dom.downloadPanel.classList.remove('open');
-    openDrawer('regions');
-  });
 
   // Tracking
   dom.btnTrack.addEventListener('click', () => {
     if (state.tracking) stopTracking();
     else startTracking();
-  });
-
-  // Center & lock
-  dom.btnCenter.addEventListener('click', centerOnMe);
-  dom.btnLock.addEventListener('click', () => {
-    state.lockToGps = !state.lockToGps;
-    dom.btnLock.classList.toggle('active', state.lockToGps);
-    showToast(state.lockToGps ? 'Camera locked to GPS' : 'Camera lock off');
   });
 
   // Trails drawer
@@ -1188,6 +1188,7 @@ function bindEvents() {
   dom.trailsOverlay.addEventListener('click', () => closeDrawer('trails'));
 
   // Regions drawer
+  dom.btnRegions.addEventListener('click', () => openDrawer('regions'));
   dom.regionsClose.addEventListener('click', () => closeDrawer('regions'));
   dom.regionsOverlay.addEventListener('click', () => closeDrawer('regions'));
   dom.btnDeleteAllRegions.addEventListener('click', deleteAllRegions);
@@ -1208,16 +1209,24 @@ function bindEvents() {
   window.addEventListener('offline', () => {
     if (!state.downloading) dom.offlineBanner.classList.add('show');
   });
+
+  dom.hud.addEventListener('transitionend', (e) => {
+    if (e.propertyName === 'max-height') syncTrackingLayout();
+  });
+  window.addEventListener('resize', () => {
+    if (!dom.hud.classList.contains('hidden')) syncTrackingLayout();
+  });
 }
 
 // ─── Bootstrap ─────────────────────────────────────────────────────────────────
 
 async function init() {
+  bindEvents();
   await registerServiceWorker();
   await requestPersistentStorage();
   initMap();
-  bindEvents();
-  renderRegionsDrawer();
+  await renderRegionsDrawer();
+  if (!navigator.onLine) restoreOfflineView();
 }
 
 document.addEventListener('DOMContentLoaded', init);
