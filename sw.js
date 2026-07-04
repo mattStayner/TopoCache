@@ -5,15 +5,15 @@
 
 const CACHE_NAME = 'topocache-v1';
 const APP_SHELL = [
-  '/',
-  '/index.html',
-  '/config.js',
-  '/app.js',
-  '/manifest.json',
-  '/icons/icon-192.svg',
-  '/icons/icon-512.svg',
-  '/vendor/maplibre-gl.js',
-  '/vendor/maplibre-gl.css',
+  './',
+  './index.html',
+  './config.js',
+  './app.js',
+  './manifest.json',
+  './icons/icon-192.svg',
+  './icons/icon-512.svg',
+  './vendor/maplibre-gl.js',
+  './vendor/maplibre-gl.css',
 ];
 
 const MAPTILER_HOSTS = ['api.maptiler.com', 'cdn.maptiler.com'];

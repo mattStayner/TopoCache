@@ -2,7 +2,7 @@
   "name": "TopoCache",
   "short_name": "TopoCache",
   "description": "Offline topo maps and hike tracking for the backcountry",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#0f1419",
   "theme_color": "#0f1419",
