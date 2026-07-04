@@ -1,1 +1,5 @@
 config.js
+node_modules/
+www/
+android/
+.capacitor/

@@ -221,6 +221,60 @@
 
     .offline-banner.show { display: block; }
 
+    .startup-status {
+      position: fixed;
+      top: calc(12px + var(--safe-top));
+      left: calc(12px + var(--safe-left));
+      right: calc(12px + var(--safe-right));
+      z-index: 1000;
+      pointer-events: auto;
+      background: rgba(26, 34, 41, 0.96);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 0.72rem;
+      line-height: 1.45;
+      display: none;
+      max-height: 45vh;
+      overflow: auto;
+      box-shadow: var(--shadow);
+    }
+
+    .startup-status.show { display: block; }
+
+    .startup-status.error {
+      border-color: rgba(255, 92, 92, 0.45);
+    }
+
+    .startup-status.ok {
+      border-color: rgba(0, 229, 160, 0.35);
+    }
+
+    .startup-status-title {
+      font-size: 0.8rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+
+    .startup-status.error .startup-status-title { color: var(--danger); }
+    .startup-status.ok .startup-status-title { color: var(--accent); }
+
+    .startup-status-line { color: var(--text-muted); }
+    .startup-status-line.fail { color: #ffb347; }
+    .startup-status-line.pass { color: var(--accent); }
+
+    .startup-status-dismiss {
+      margin-top: 10px;
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 0.72rem;
+      cursor: pointer;
+    }
+
     /* ── Modal ── */
     .modal-overlay {
       position: fixed;
@@ -707,6 +761,8 @@
       <button class="btn btn-danger" id="btn-delete-all-regions" style="width:100%">Delete All Cached Maps</button>
     </div>
   </aside>
+
+  <div class="startup-status" id="startup-status" role="status" aria-live="polite"></div>
 
   <script src="vendor/maplibre-gl.js"></script>
   <script src="config.js"></script>

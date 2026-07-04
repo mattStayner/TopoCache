@@ -1,0 +1,11 @@
+{
+  "appId": "com.topocache.app",
+  "appName": "TopoCache",
+  "webDir": "www",
+  "android": {
+    "useLegacyBridge": true
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

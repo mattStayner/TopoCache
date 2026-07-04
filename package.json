@@ -1,0 +1,21 @@
+{
+  "name": "topocache",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Offline topo maps and hike tracking",
+  "scripts": {
+    "build:cap": "node scripts/build-www.mjs",
+    "cap:sync": "npm run build:cap && npx cap sync",
+    "cap:open": "npx cap open android"
+  },
+  "dependencies": {
+    "@capacitor-community/background-geolocation": "^1.2.26",
+    "@capacitor/android": "^7.2.0",
+    "@capacitor/core": "^7.2.0",
+    "@capacitor/local-notifications": "^7.0.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.2.0",
+    "esbuild": "^0.25.0"
+  }
+}

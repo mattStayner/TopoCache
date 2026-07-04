@@ -10,7 +10,7 @@ const APP_SECRETS = window.APP_CONFIG || {};
 const CONFIG = {
   MAPTILER_KEY: APP_SECRETS.MAPTILER_KEY || '',
   STYLE_URL: 'https://api.maptiler.com/maps/outdoor-v2/style.json',
-  CACHE_NAME: 'topocache-v1',
+  CACHE_NAME: 'topocache-v2',
   DB_NAME: 'topocache-db',
   DB_VERSION: 2,
   STORE_TRAILS: 'trails',
@@ -33,6 +33,8 @@ const CONFIG = {
 
 const state = {
   map: null,
+  mapStyleLoaded: false,
+  mapLoadTimeout: null,
   tracking: false,
   geolocate: null,
   timerInterval: null,
@@ -43,6 +45,7 @@ const state = {
   lastTimestamp: null,
   visibleTrails: new Set(),
   gpsWatchId: null,
+  nativeGpsModule: null,
   downloading: false,
   downloadAbort: null,
   pendingRegionTiles: [],
@@ -64,6 +67,7 @@ const dom = {
   statSpeed: $('stat-speed'),
   hudWarning: $('hud-warning'),
   offlineBanner: $('offline-banner'),
+  startupStatus: $('startup-status'),
   toast: $('toast'),
   btnTrack: $('btn-track'),
   btnTrails: $('btn-trails'),
@@ -131,6 +135,21 @@ async function registerServiceWorker() {
     console.warn('Service workers not supported');
     return;
   }
+
+  // Bundled native builds should not use a cache-first SW — it serves stale app.js/html.
+  if (isCapacitorNative()) {
+    try {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((reg) => reg.unregister()));
+      const keys = await caches.keys();
+      await Promise.all(keys.filter((k) => k.startsWith('topocache-')).map((k) => caches.delete(k)));
+      console.log('Native app: cleared service worker and app caches');
+    } catch (err) {
+      console.warn('Failed to clear native service worker caches', err);
+    }
+    return;
+  }
+
   try {
     const reg = await navigator.serviceWorker.register('sw.js');
     console.log('Service worker registered:', reg.scope);
@@ -290,6 +309,88 @@ async function clearActiveSession() {
 }
 
 // ─── Utility Functions ───────────────────────────────────────────────────────
+
+/** Mask API key for diagnostics display */
+function maskSecret(value) {
+  if (!value) return '(empty)';
+  if (value.length <= 6) return '***';
+  return `${value.slice(0, 4)}…${value.slice(-2)}`;
+}
+
+function getStartupContext() {
+  const cap = window.Capacitor;
+  return {
+    platform: cap?.getPlatform?.() ?? 'web',
+    native: cap?.isNativePlatform?.() ?? false,
+    online: navigator.onLine,
+    origin: location.origin,
+    path: location.pathname,
+  };
+}
+
+function renderStartupStatus(title, lines, { error = false, dismissible = false } = {}) {
+  if (!dom.startupStatus) return;
+  const lineHtml = lines
+    .map(({ text, ok }) => {
+      const cls = ok === true ? 'pass' : ok === false ? 'fail' : '';
+      const prefix = ok === true ? '✓ ' : ok === false ? '✗ ' : '· ';
+      return `<div class="startup-status-line ${cls}">${prefix}${text}</div>`;
+    })
+    .join('');
+  const dismiss = dismissible
+    ? '<button type="button" class="startup-status-dismiss" id="startup-status-dismiss">Dismiss</button>'
+    : '';
+  dom.startupStatus.className = `startup-status show ${error ? 'error' : 'ok'}`;
+  dom.startupStatus.innerHTML = `<div class="startup-status-title">${title}</div>${lineHtml}${dismiss}`;
+  const btn = $('startup-status-dismiss');
+  if (btn) btn.addEventListener('click', hideStartupStatus, { once: true });
+}
+
+function hideStartupStatus() {
+  dom.startupStatus?.classList.remove('show', 'error', 'ok');
+  if (dom.startupStatus) dom.startupStatus.innerHTML = '';
+}
+
+async function verifyLocalAsset(path) {
+  try {
+    const res = await fetch(path, { cache: 'no-store' });
+    if (!res.ok) return { ok: false, detail: `HTTP ${res.status}` };
+    const len = res.headers.get('content-length');
+    return { ok: true, detail: len ? `${len} bytes` : 'loaded' };
+  } catch (err) {
+    return { ok: false, detail: err.message || 'fetch failed' };
+  }
+}
+
+async function verifyMapTilerStyle(styleUrl) {
+  try {
+    const res = await fetch(styleUrl, { cache: 'no-store' });
+    if (!res.ok) {
+      return {
+        ok: false,
+        detail: `HTTP ${res.status} — check API key and URL restrictions in MapTiler Cloud`,
+      };
+    }
+    const style = await res.json();
+    const sources = Object.keys(style?.sources || {}).length;
+    return { ok: true, detail: `${sources} source(s) in style` };
+  } catch (err) {
+    return { ok: false, detail: err.message || 'fetch failed' };
+  }
+}
+
+function describeMapError(errorEvent) {
+  const err = errorEvent?.error;
+  const parts = [];
+  if (err?.message) parts.push(err.message);
+  if (errorEvent?.sourceId) parts.push(`source: ${errorEvent.sourceId}`);
+  if (errorEvent?.tile?.tileID) {
+    const t = errorEvent.tile.tileID;
+    parts.push(`tile: z${t.canonical?.z} x${t.canonical?.x} y${t.canonical?.y}`);
+  }
+  if (errorEvent?.url) parts.push(String(errorEvent.url));
+  return parts.join(' · ') || 'Unknown map error';
+}
 
 /** Show a brief toast message */
 let toastTimer = null;
@@ -516,21 +617,78 @@ function runWithoutMapViewSave(fn) {
 
 // ─── Map Initialization ──────────────────────────────────────────────────────
 
-function initMap() {
-  if (typeof maplibregl === 'undefined') {
+async function initMap() {
+  const ctx = getStartupContext();
+  const lines = [
+    { text: `Platform: ${ctx.platform}${ctx.native ? ' (native)' : ''}`, ok: null },
+    { text: `Online: ${ctx.online ? 'yes' : 'no'} · Origin: ${ctx.origin}`, ok: ctx.online },
+  ];
+
+  renderStartupStatus('Checking map setup…', lines);
+
+  const vendorJs = await verifyLocalAsset('vendor/maplibre-gl.js');
+  lines.push({
+    text: `vendor/maplibre-gl.js — ${vendorJs.ok ? vendorJs.detail : vendorJs.detail}`,
+    ok: vendorJs.ok,
+  });
+
+  const vendorCss = await verifyLocalAsset('vendor/maplibre-gl.css');
+  lines.push({
+    text: `vendor/maplibre-gl.css — ${vendorCss.ok ? vendorCss.detail : vendorCss.detail}`,
+    ok: vendorCss.ok,
+  });
+
+  const maplibreLoaded = typeof maplibregl !== 'undefined';
+  lines.push({
+    text: maplibreLoaded ? 'MapLibre GL global loaded' : 'MapLibre GL global missing (script did not run)',
+    ok: maplibreLoaded,
+  });
+  renderStartupStatus('Checking map setup…', lines);
+
+  if (!maplibreLoaded) {
     console.error('MapLibre GL failed to load');
-    showToast('Map library failed to load — reload when online once');
+    renderStartupStatus('Map library failed to load', lines, { error: true, dismissible: true });
+    showToast('Map library failed to load');
     return;
   }
 
-  if (!CONFIG.MAPTILER_KEY) {
+  const hasKey = !!CONFIG.MAPTILER_KEY;
+  lines.push({
+    text: hasKey
+      ? `MAPTILER_KEY: ${maskSecret(CONFIG.MAPTILER_KEY)}`
+      : 'MAPTILER_KEY missing — copy config.example.js to config.js, then npm run cap:sync',
+    ok: hasKey,
+  });
+
+  if (!hasKey) {
     console.error('Missing MAPTILER_KEY — copy config.example.js to config.js for local dev');
+    renderStartupStatus('Map API key not configured', lines, { error: true, dismissible: true });
     showToast('Map API key not configured');
     return;
   }
 
   const styleUrl = `${CONFIG.STYLE_URL}?key=${CONFIG.MAPTILER_KEY}`;
+  const styleCheck = await verifyMapTilerStyle(styleUrl);
+  lines.push({
+    text: styleCheck.ok
+      ? `MapTiler style — ${styleCheck.detail}`
+      : `MapTiler style — ${styleCheck.detail}`,
+    ok: styleCheck.ok,
+  });
+  renderStartupStatus('Checking map setup…', lines);
+
+  if (!styleCheck.ok) {
+    console.error('MapTiler style fetch failed', styleCheck.detail);
+    if (!ctx.online) {
+      lines.push({ text: 'Device is offline and style is not cached', ok: false });
+    }
+    renderStartupStatus('MapTiler style failed to load', lines, { error: true, dismissible: true });
+    showToast('MapTiler style failed — check key and network');
+    return;
+  }
+
   const savedView = loadMapView();
+  state.mapStyleLoaded = false;
 
   state.map = new maplibregl.Map({
     container: 'map',
@@ -553,7 +711,25 @@ function initMap() {
   state.geolocate = geolocate;
   state.map.addControl(geolocate, 'top-left');
 
+  state.mapLoadTimeout = setTimeout(() => {
+    if (state.mapStyleLoaded) return;
+    lines.push({
+      text: 'Map style did not finish loading within 15s',
+      ok: false,
+    });
+    renderStartupStatus('Map load timed out', lines, { error: true, dismissible: true });
+    showToast('Map load timed out — see diagnostics banner');
+  }, 15000);
+
   state.map.on('load', () => {
+    state.mapStyleLoaded = true;
+    clearTimeout(state.mapLoadTimeout);
+    lines.push({ text: 'Map rendered successfully', ok: true });
+    renderStartupStatus('Map ready', lines, { dismissible: true });
+    if (!isCapacitorNative()) {
+      setTimeout(hideStartupStatus, 6000);
+    }
+
     // Active trail line (live GPS breadcrumb)
     state.map.addSource('active-trail', {
       type: 'geojson',
@@ -599,8 +775,13 @@ function initMap() {
     initSavedTrailsOnMap();
   });
 
-  // Show offline banner when map fails to load tiles (no cache)
   state.map.on('error', (e) => {
+    const detail = describeMapError(e);
+    console.error('Map error', e);
+    lines.push({ text: detail, ok: false });
+    renderStartupStatus('Map runtime error', lines, { error: true, dismissible: true });
+    showToast('Map error — see diagnostics banner', 5000);
+
     if (e.error?.message?.includes('Failed to fetch') || !navigator.onLine) {
       dom.offlineBanner.classList.add('show');
     }
@@ -984,6 +1165,14 @@ async function deleteAllRegions() {
 
 // ─── GPS Tracking ────────────────────────────────────────────────────────────
 
+function isCapacitorNative() {
+  return window.Capacitor?.isNativePlatform?.() === true;
+}
+
+function canTrackGps() {
+  return isCapacitorNative() || !!navigator.geolocation;
+}
+
 function syncTrackingLayout() {
   const visible = !dom.hud.classList.contains('hidden');
   document.body.classList.toggle('tracking', visible);
@@ -1014,8 +1203,20 @@ function beginTrackingUI() {
     '<svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>';
 }
 
-function startGpsWatch() {
+async function startGpsWatch() {
   state.timerInterval = setInterval(updateStatsHUD, 1000);
+
+  if (isCapacitorNative()) {
+    if (!state.nativeGpsModule) {
+      state.nativeGpsModule = await import('./native-gps.mjs');
+    }
+    state.gpsWatchId = await state.nativeGpsModule.startBackgroundGps(
+      onNativeLocationUpdate,
+      onNativeGpsError
+    );
+    return;
+  }
+
   state.gpsWatchId = navigator.geolocation.watchPosition(
     onPositionUpdate,
     () => {
@@ -1025,9 +1226,9 @@ function startGpsWatch() {
   );
 }
 
-function startTracking() {
+async function startTracking() {
   if (state.tracking) return;
-  if (!navigator.geolocation) {
+  if (!canTrackGps()) {
     showToast('Geolocation not supported on this device');
     return;
   }
@@ -1041,13 +1242,13 @@ function startTracking() {
   state.startTime = Date.now();
 
   beginTrackingUI();
-  startGpsWatch();
+  await startGpsWatch();
   persistActiveSession();
 }
 
 async function resumeTracking(session) {
   if (state.tracking) return;
-  if (!navigator.geolocation) {
+  if (!canTrackGps()) {
     showToast('Geolocation not supported on this device');
     return;
   }
@@ -1062,7 +1263,7 @@ async function resumeTracking(session) {
   beginTrackingUI();
   updateActiveTrail();
   updateStatsHUD();
-  startGpsWatch();
+  await startGpsWatch();
   showToast('Resumed hike recording');
 }
 
@@ -1076,13 +1277,17 @@ async function restoreActiveSession() {
   }
 }
 
-function stopTracking() {
+async function stopTracking() {
   if (!state.tracking) return;
 
   clearInterval(state.timerInterval);
   state.timerInterval = null;
   if (state.gpsWatchId != null) {
-    navigator.geolocation.clearWatch(state.gpsWatchId);
+    if (isCapacitorNative() && state.nativeGpsModule) {
+      await state.nativeGpsModule.stopBackgroundGps(state.gpsWatchId);
+    } else {
+      navigator.geolocation.clearWatch(state.gpsWatchId);
+    }
     state.gpsWatchId = null;
   }
   state.tracking = false;
@@ -1108,10 +1313,7 @@ function stopTracking() {
   maybeReloadForServiceWorker();
 }
 
-function onPositionUpdate(pos) {
-  const { latitude, longitude, accuracy } = pos.coords;
-  const timestamp = pos.timestamp;
-
+function acceptLocationUpdate({ latitude, longitude, accuracy, timestamp }) {
   if (accuracy > CONFIG.GPS_ACCURACY_THRESHOLD) return;
   if (timestamp === state.lastTimestamp) return;
 
@@ -1128,6 +1330,34 @@ function onPositionUpdate(pos) {
   updateActiveTrail();
   dom.hudWarning.textContent = '';
   persistActiveSession();
+}
+
+function onPositionUpdate(pos) {
+  acceptLocationUpdate({
+    latitude: pos.coords.latitude,
+    longitude: pos.coords.longitude,
+    accuracy: pos.coords.accuracy,
+    timestamp: pos.timestamp,
+  });
+}
+
+function onNativeLocationUpdate(location) {
+  acceptLocationUpdate({
+    latitude: location.latitude,
+    longitude: location.longitude,
+    accuracy: location.accuracy,
+    timestamp: location.time,
+  });
+}
+
+function onNativeGpsError(error) {
+  if (!state.tracking) return;
+  if (error?.code === 'NOT_AUTHORIZED') {
+    dom.hudWarning.textContent = 'Location permission required';
+    return;
+  }
+  dom.hudWarning.textContent = 'GPS signal weak';
+  console.warn('Background geolocation error', error);
 }
 
 function updateActiveTrail() {
@@ -1434,8 +1664,8 @@ function bindEvents() {
 
   // Tracking
   dom.btnTrack.addEventListener('click', () => {
-    if (state.tracking) stopTracking();
-    else startTracking();
+    if (state.tracking) void stopTracking();
+    else void startTracking();
   });
 
   // Trails drawer
@@ -1481,10 +1711,13 @@ function bindEvents() {
 // ─── Bootstrap ─────────────────────────────────────────────────────────────────
 
 async function init() {
+  renderStartupStatus('Starting TopoCache…', [
+    { text: 'Running startup checks', ok: null },
+  ]);
   bindEvents();
   await registerServiceWorker();
   await requestPersistentStorage();
-  initMap();
+  await initMap();
   await restoreActiveSession();
   await renderRegionsDrawer();
   if (!navigator.onLine) restoreOfflineView();
