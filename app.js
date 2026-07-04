@@ -5,8 +5,10 @@
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
+const APP_SECRETS = window.APP_CONFIG || {};
+
 const CONFIG = {
-  MAPTILER_KEY: 'VquLuyko0vFYcjpk2FW8',
+  MAPTILER_KEY: APP_SECRETS.MAPTILER_KEY || '',
   STYLE_URL: 'https://api.maptiler.com/maps/outdoor-v2/style.json',
   CACHE_NAME: 'topocache-v1',
   DB_NAME: 'topocache-db',
@@ -518,6 +520,12 @@ function initMap() {
   if (typeof maplibregl === 'undefined') {
     console.error('MapLibre GL failed to load');
     showToast('Map library failed to load — reload when online once');
+    return;
+  }
+
+  if (!CONFIG.MAPTILER_KEY) {
+    console.error('Missing MAPTILER_KEY — copy config.example.js to config.js for local dev');
+    showToast('Map API key not configured');
     return;
   }
 

@@ -7,6 +7,7 @@ const CACHE_NAME = 'topocache-v1';
 const APP_SHELL = [
   '/',
   '/index.html',
+  '/config.js',
   '/app.js',
   '/manifest.json',
   '/icons/icon-192.svg',
